@@ -5,7 +5,9 @@
 #include <CGAL/Default.h>
 #include <CGAL/tuple.h>
 #include <CGAL/Simple_cartesian.h>
-
+#include <thread>
+#include <future>
+#include <mutex>
 #include <vector>
 #include <list>
 #include <utility>
@@ -15,6 +17,7 @@
 #include <CGAL/Kernel/global_functions_3.h>
 #include <CGAL/property_map.h>
 #include <CGAL/Eigen_solver_traits.h>
+#include <CGAL/FPU_extension.h>
 #include <Eigen/Eigen>
 #include <Eigen/SVD>
 
@@ -37,9 +40,13 @@ public:
 	typedef typename Eigen::Matrix3d CR_matrix;
 	typedef typename Eigen::Vector3d CR_vector;
 
+	double avg_solver_time;
+	double avg_rotation_time;
 private:
 
 	Triangle_mesh& triangle_mesh;
+
+	std::mutex mtex;
 
 	std::vector<Point> original;
 	std::vector<Point> solution;
@@ -55,6 +62,7 @@ private:
 	std::vector<CR_matrix> rotation_matrix;
 	Sparse_linear_solver linear_solver;
 	Vertex_point_map vertex_point_map;
+	typename Sparse_linear_solver::Matrix *A;
 
 	bool preprocess_successful;
 	bool is_ids_cal_done;
@@ -77,8 +85,8 @@ public:
 	  {
 		  halfedge_weights.push_back(calculate_weight(*eb));
 	  }
-	  
-	   
+	  avg_rotation_time = 0.0;
+	  avg_solver_time = 0.0;
   }
 
   bool insert_control_vertex(vertex_descriptor vd, CGAL::Simple_cartesian<double>::Point_3 &point)
@@ -96,6 +104,14 @@ public:
 	  return true;
   }
 
+  void insert_roi_vertices(vertex_iterator begin, vertex_iterator end)
+  {
+	  for (; begin != end; ++begin)
+	  {
+		  insert_roi_vertex(*begin);
+	  }
+  }
+
   bool insert_roi_vertex(vertex_descriptor vd)
   {
 	  if (is_roi_vertex(vd)) 
@@ -111,8 +127,11 @@ public:
 
   bool preprocess()
   {
+	  Timer tmr;
 	  init_ids_and_rotations();
 	  calculate_laplacian_and_factorize();
+	  double t = tmr.elapsed();
+	  std::cout << "Preprocess Time: " << t << std::endl;
 	  return preprocess_successful;
   }
 
@@ -129,15 +148,17 @@ public:
 
   void deform(unsigned int iterations, double tolerance)
   {
-	  // preprocess();
+	  
 
 	  if (!preprocess_successful) {
 		  return;
 	  }
 	  double energy_this = 0;
 	  double energy_last;
+	  int itrs = 0;
 	  for (unsigned int ite = 0; ite < iterations; ++ite)
 	  {
+		  itrs+=1;
 		  calculate_target_positions();
 		  calculate_optimal_rotations();
 		  if (tolerance > 0.0 && (ite + 1) < iterations)
@@ -154,6 +175,11 @@ public:
 			  }
 		  }
 	  }
+	  avg_rotation_time = avg_rotation_time / double(itrs);
+	  avg_solver_time = avg_solver_time / double(itrs);
+
+	  std::cout << "Iterations Count: " << itrs << std::endl;
+	  std::cout << "Avg. Solver Time:  " << avg_solver_time << "    Avg. Rotation Time:  " << avg_rotation_time << std::endl;
 
 	  for (std::size_t i = 0; i < ros.size(); ++i) {
 		  std::size_t v_id = get_ros_id(ros[i]);
@@ -202,8 +228,26 @@ public:
 	  generate_roi_recursive(0, max_radius, vd, list);
   }
 
+  void reset()
+  {
+	  if (roi.empty()) { return; } // no ROI to reset
 
+	  //region_of_solution(); // not doing it coz roi is always the same, also my version of this function would modify the original array
 
+	  //restore the current positions to be the original positions
+	  BOOST_FOREACH(vertex_descriptor vd, roi)
+	  {
+		  put(vertex_point_map, vd, original[get_ros_id(vd)]);
+		  solution[get_ros_id(vd)] = original[get_ros_id(vd)];
+	  }
+
+	  // also set rotation matrix to identity
+	  std::fill(rotation_matrix.begin(), rotation_matrix.end(), CR_matrix().setIdentity());
+	  avg_rotation_time = 0.0;
+	  avg_solver_time = 0.0;
+  }
+
+  
 private:
 
 
@@ -302,8 +346,9 @@ private:
     }
   }
 
+
  
-  void init_ids_and_rotations()
+  void init_ids_and_rotations() // Assuming we are using whole mesh in ROI
   {
 
 	if (is_ids_cal_done)
@@ -319,42 +364,54 @@ private:
     { 
 		get_ros_id(roi[i]) = i; 
 	}
-
-   
-    std::size_t next_ros_index = roi.size();
-    for(std::size_t i = 0; i < roi.size(); i++)
-    { 
-		assign_ros_id_to_one_ring(roi[i], next_ros_index, ros); 
+    
+	rotation_matrix.resize(ros.size());
+	for (std::size_t i = 0; i < rotation_matrix.size(); i++)
+	{
+		std::size_t v_ros_id = get_ros_id(ros[i]);
+		rotation_matrix[v_ros_id] = CR_matrix().setIdentity();
 	}
 
-    std::vector<vertex_descriptor> outside_ros;
-    
-    for(std::size_t i = roi.size(); i < ros.size(); i++)
-    { assign_ros_id_to_one_ring(ros[i], next_ros_index, outside_ros); }
-    
-    rotation_matrix.resize(ros.size());
-    for(std::size_t i = 0; i < rotation_matrix.size(); i++)
-    {
-      std::size_t v_ros_id = get_ros_id(ros[i]);
-	  rotation_matrix[v_ros_id] = CR_matrix().setIdentity();
-    }
+	solution.resize(ros.size());
+	original.resize(ros.size());
 
-    solution.resize(ros.size() + outside_ros.size());
-    original.resize(ros.size() + outside_ros.size());
+	for (std::size_t i = 0; i < ros.size(); i++)
+	{
+		std::size_t v_ros_id = get_ros_id(ros[i]);
+		solution[v_ros_id] = get(vertex_point_map, ros[i]);
+		original[v_ros_id] = get(vertex_point_map, ros[i]);
+	}
 
-    for(std::size_t i = 0; i < ros.size(); i++)
-    {
-      std::size_t v_ros_id = get_ros_id(ros[i]);
-	  solution[v_ros_id] = get(vertex_point_map, ros[i]);
-	  original[v_ros_id] = get(vertex_point_map, ros[i]);
-    }
-	
-    for(std::size_t i = 0; i < outside_ros.size(); ++i)
-    {
-      std::size_t v_ros_id = get_ros_id(outside_ros[i]);
-      original[v_ros_id] = get(vertex_point_map, outside_ros[i]);
-      solution[v_ros_id] = get(vertex_point_map, outside_ros[i]);
-    }
+	//initialize_rotation_matrices();
+	//assign_initial_positions();
+
+	/*std::thread t1(&Arap_mesh_deformation::initialize_rotation_matrices, this);
+	std::thread t2(&Arap_mesh_deformation::assign_initial_positions, this);
+	t1.join();
+	t2.join();*/
+  }
+
+  void initialize_rotation_matrices()
+  {
+	  rotation_matrix.resize(ros.size());
+	  for (std::size_t i = 0; i < rotation_matrix.size(); i++)
+	  {
+		  std::size_t v_ros_id = get_ros_id(ros[i]);
+		  rotation_matrix[v_ros_id] = CR_matrix().setIdentity();
+	  }
+  }
+
+  void assign_initial_positions()
+  {
+	  solution.resize(ros.size());
+	  original.resize(ros.size());
+
+	  for (std::size_t i = 0; i < ros.size(); i++)
+	  {
+		  std::size_t v_ros_id = get_ros_id(ros[i]);
+		  solution[v_ros_id] = get(vertex_point_map, ros[i]);
+		  original[v_ros_id] = get(vertex_point_map, ros[i]);
+	  }
   }
 
   /// Construct matrix that corresponds to left-hand side of eq:lap_ber == LP' = b and 
@@ -364,7 +421,9 @@ private:
 	  if (factorization_done)
 		  return;
 	  factorization_done = true;
-	  typename Sparse_linear_solver::Matrix A(ros.size());
+	  //typename Sparse_linear_solver::Matrix A(ros.size());
+	  A = new typename Sparse_linear_solver::Matrix(ros.size());
+	  std::vector<std::thread> threds;
 	  for (std::size_t k = 0; k < ros.size(); k++)
 	  {
 		  vertex_descriptor vi = ros[k];
@@ -377,33 +436,69 @@ private:
 			  {
 				  halfedge_descriptor he = halfedge(*e, triangle_mesh);
 				  vertex_descriptor vj = source(he, triangle_mesh);
-				  double wij = halfedge_weights[get_edge_id(he)];  
+				  double wij = halfedge_weights[get_edge_id(he)];
 				  double wji = halfedge_weights[get_edge_id(opposite(he, triangle_mesh))];
 				  double total_weight = wij + wji;
 
-				  A.set_coef(vi_id, get_ros_id(vj), -total_weight, true); // for non-diagonal entries, value is -(wij+wji)
+				  //set_mat_coef(vi_id, get_ros_id(vj), -total_weight);
+				  A->set_coef(vi_id, get_ros_id(vj), -total_weight, true); // for non-diagonal entries, value is -(wij+wji)
 				  diagonal_val += total_weight;
 			  }
-			  
-			  A.set_coef(vi_id, vi_id, diagonal_val, true); // diagonal entries are sum of all others(1-ring) in this row
+
+			  A->set_coef(vi_id, vi_id, diagonal_val, true);
+			  //set_mat_coef(vi_id, vi_id, diagonal_val);
+			  //threds.push_back(std::thread(&Arap_mesh_deformation::setup_mat_for_non_ctrl, this, vi, vi_id));
 		  }
 		  else
 		  {
-			  A.set_coef(vi_id, vi_id, 1.0, true); // for control vertices just set to 1 coz their target position comes from user
+			  //set_mat_coef(vi_id, vi_id, 1.0);
+			  A->set_coef(vi_id, vi_id, 1.0, true); // for control vertices just set to 1 coz their target position comes from user
 		  }
 	  }
 
+	  /*for (auto& th : threds) {
+		  th.join();
+	  }*/
 	  
 	  double D;
-	  preprocess_successful = linear_solver.factor(A, D);
+	  preprocess_successful = linear_solver.factor(*A, D);
   }
   
+  void setup_mat_for_non_ctrl(vertex_descriptor vi, std::size_t vi_id)
+  {
+	  double diagonal_val = 0;
+	  in_edge_iterator e, e_end;
+	  for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++) // loop over 1-ring
+	  {
+		  halfedge_descriptor he = halfedge(*e, triangle_mesh);
+		  vertex_descriptor vj = source(he, triangle_mesh);
+		  double wij = halfedge_weights[get_edge_id(he)];
+		  double wji = halfedge_weights[get_edge_id(opposite(he, triangle_mesh))];
+		  double total_weight = wij + wji;
+
+		  set_mat_coef(vi_id, get_ros_id(vj), -total_weight);
+		  //A->set_coef(vi_id, get_ros_id(vj), -total_weight, true); // for non-diagonal entries, value is -(wij+wji)
+		  diagonal_val += total_weight;
+	  }
+
+	  set_mat_coef(vi_id, vi_id, diagonal_val);
+	  //A->set_coef(vi_id, vi_id, diagonal_val, true); // diagonal entries are sum of all others(1-ring) in this row
+  }
+
+  void set_mat_coef(size_t row, size_t column, double val)
+  {
+	  mtex.lock();
+	  if (A != NULL)
+		  A->set_coef(row, column, val, true);
+	  mtex.unlock();
+  }
+
   // Covariance matrix S = SumOverOneRing(wij * pij * qij.transpose)
   void calculate_optimal_rotations()
   {
-
+	  Timer tmr;
 	  CR_matrix cov = CR_matrix().setZero();
-
+	  std::vector<std::thread> threds;
 	  for (std::size_t k = 0; k < ros.size(); k++)
 	  {
 		  vertex_descriptor vi = ros[k];
@@ -426,11 +521,16 @@ private:
 			  cov += wij * (pij * qij.transpose());
 
 		  }
-
-		  compute_close_rotation(cov, rotation_matrix[vi_id]);
+		
+		  threds.push_back(std::thread(&Arap_mesh_deformation::compute_close_rotation, this, cov, std::ref(rotation_matrix[vi_id])));
 	  }
-  }
 
+	  for (auto& th : threds) {
+		  th.join();
+	  }
+
+	  avg_rotation_time += tmr.elapsed();
+  }
 
   void calculate_target_positions()
   {
@@ -475,12 +575,21 @@ private:
 		  }
 	  }
 	  // Call solver for each dimension of the point seperately 
-	  bool is_all_solved = linear_solver.linear_solver(Bx, X) && linear_solver.linear_solver(By, Y) && linear_solver.linear_solver(Bz, Z);
+	  Timer tmr;
+	  auto sol1 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(Bx), std::ref(X));
+	  auto sol2 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(By), std::ref(Y));
+	  auto sol3 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(Bz), std::ref(Z));
+	  
+	  //bool is_all_solved = linear_solver.linear_solver(Bx, X) && linear_solver.linear_solver(By, Y) && linear_solver.linear_solver(Bz, Z);
+	  bool is_all_solved = sol1.get() && sol2.get() && sol3.get();
+
+	  avg_solver_time += tmr.elapsed();
+
 	  if (!is_all_solved) {
 		  // could not solve all
 		  return;
 	  }
-	  
+
 	  for (std::size_t i = 0; i < ros.size(); i++)
 	  {
 		  std::size_t v_id = get_ros_id(ros[i]);
@@ -490,6 +599,11 @@ private:
 	  }
   }
   
+  bool solver(Sparse_linear_solver::Vector& B, Sparse_linear_solver::Vector& X)
+  {
+	  return linear_solver.linear_solver(B, X);
+  }
+
   // Get original vertex id
   std::size_t get_vertex_id(vertex_descriptor vd) const
   { 
@@ -515,7 +629,17 @@ private:
 
   // Calculate the closest rotation, which according to paper is : R = V*(identity_mtrix with last element == det(V*U.transpose()))*U.transpose()
   // det(V*U.transpose()) can be +1 or -1
-  void compute_close_rotation(const CR_matrix& m, CR_matrix& R)
+  void compute_close_rotation(const CR_matrix m, CR_matrix& R)
+  {
+	  bool done = compute_polar_decomposition(m, R);
+
+	  if (!done)
+	  {
+		  compute_rotation_svd(m, R);
+	  }
+  }
+
+  void compute_rotation_svd(const CR_matrix& m, CR_matrix& R)
   {
 	  Eigen::JacobiSVD<Eigen::Matrix3d> solver;
 	  solver.compute(m, Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -526,9 +650,41 @@ private:
 	  // If determinanat of rotation is < 0 , then multiply last column of U with -1 and calculate rotation again
 	  if (R.determinant() < 0) {
 		  CR_matrix u_copy = u;
-		  u_copy.col(2) *= -1;        
-		  R = v * u_copy.transpose(); 
+		  u_copy.col(2) *= -1;
+		  R = v * u_copy.transpose();
 	  }
+  
+  }
+
+  bool compute_polar_decomposition(const CR_matrix& A, CR_matrix& R)
+  {
+	  if (A.determinant() < 0)
+	  {
+		  return false;
+	  }
+
+	  typedef CR_matrix::Scalar Scalar;
+
+	  const Scalar th = std::sqrt(Eigen::NumTraits<Scalar>::dummy_precision());
+
+	  Eigen::SelfAdjointEigenSolver<CR_matrix> eig;
+	  CGAL::feclearexcept(FE_UNDERFLOW);
+	  eig.computeDirect(A.transpose()*A);
+	  if (CGAL::fetestexcept(FE_UNDERFLOW) || eig.eigenvalues()(0) / eig.eigenvalues()(2)<th)
+	  {
+		  return false;
+	  }
+
+	  CR_vector S = eig.eigenvalues().cwiseSqrt();
+	  R = A  * eig.eigenvectors() * S.asDiagonal().inverse() * eig.eigenvectors().transpose();
+
+	  if (std::abs(R.squaredNorm() - 3.) > th || R.determinant() < 0)
+	  {
+		  return false;
+	  }
+
+	  R.transposeInPlace(); // the optimal rotation matrix should be transpose of decomposition result
+	  return true;
   }
 
 };
