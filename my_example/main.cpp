@@ -9,6 +9,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <chrono>
 
 #include <igl/readOFF.h>
 #include <igl/unproject.h>
@@ -34,6 +35,23 @@ vertex_iterator vb, ve;
 
 
 
+class Timer
+{
+public:
+	Timer() : beg_(clock_::now()) {}
+	void reset() { beg_ = clock_::now(); }
+	double elapsed() const {
+		return std::chrono::duration_cast<second_>
+			(clock_::now() - beg_).count();
+	}
+
+private:
+	typedef std::chrono::high_resolution_clock clock_;
+	typedef std::chrono::duration<double, std::ratio<1> > second_;
+	std::chrono::time_point<clock_> beg_;
+};
+
+
 // CGAL related mesh setup
 bool setup_mesh_for_deformation(const char* filename) {
 
@@ -53,8 +71,10 @@ bool setup_mesh_for_deformation(const char* filename) {
 		delete deform_mesh;
 		deform_mesh = NULL;
 	}
+
 	deform_mesh = new mesh_deformation(mesh);
 	boost::tie(vb, ve) = vertices(mesh);
+	deform_mesh->insert_roi_vertices(vb, ve); // use whole mesh as ROI
 	return true;
 }
 
@@ -66,6 +86,8 @@ int main(int argc, char *argv[])
   float original_z = 0.0f;
   bool clicked_outside_mesh = true;
   int last_vid = -1, roi_radius=3;
+
+  std::map<int, mesh_deformation::Point> id_point_map;
 
   Eigen::MatrixXd V, C;
   Eigen::MatrixXi F;
@@ -97,16 +119,21 @@ int main(int argc, char *argv[])
 		  ss = igl::unproject(win_d, mvv, viewer.core.proj, viewer.core.viewport); // convert current mouse pos,from screen to object coordinates
 		  
 		  
-		  // The definition of the ROI and the control vertex is done, call preprocess
-		  bool is_matrix_factorization_OK = deform_mesh->preprocess();
-		  if (!is_matrix_factorization_OK) {
-			  std::cerr << "Error in preprocessing, check documentation of preprocess()" << std::endl;
-			  return 1;
-		  }
 		  // Set target positions of control vertices
-		  vertex_descriptor vd = *CGAL::cpp11::next(vb, last_vid);
-		  deform_mesh->set_target_position(vd, mesh_deformation::Point(ss.x(), ss.y(), ss.z()));
-		  deform_mesh->deform(10, 0.0);
+
+		  id_point_map[last_vid] = mesh_deformation::Point(ss.x(), ss.y(), ss.z());
+		  vertex_descriptor vd;
+		  
+		 // Have to set target positions for all ctrls coz during reset we lost these positions 
+		 for (std::map<int, mesh_deformation::Point>::iterator ii = id_point_map.begin(); ii != id_point_map.end(); ++ii)
+		  {
+			 vd = *CGAL::cpp11::next(vb, ii->first);
+			 deform_mesh->set_target_position(vd,ii->second);
+		  }
+		 
+		  Timer tmr;
+		  deform_mesh->deform(20, 0.0);
+		  
 		  std::ofstream output(DEFORMED_MESH_PATH);
 		  output << mesh;
 		  output.close();
@@ -115,8 +142,10 @@ int main(int argc, char *argv[])
 		  igl::readOFF(DEFORMED_MESH_PATH, V, F); // Load the deformed mesh as current mesh
 		  viewer.data.set_mesh(V, F);
 		  viewer.data.set_colors(C);
-		  setup_mesh_for_deformation(DEFORMED_MESH_PATH); // Setup CGAL code with new mesh
-
+		  deform_mesh->reset();
+		  double t = tmr.elapsed();
+		  
+		  std::cout << "Total Elapsed Time: " << t << std::endl; // Time Elapsed
 		  return true;
 	  }
 	  return false;
@@ -149,18 +178,22 @@ int main(int argc, char *argv[])
 		  int i;
 		  bc.maxCoeff(&i);
 		  last_vid = F(face_id, i); // retrieve the vertex id clicked by using the retrieved face_id
-		  vertex_descriptor control_vertex = *CGAL::cpp11::next(vb, last_vid);
-		  std::vector<vertex_descriptor> ring_list;
-		  deform_mesh->generate_roi_from_vertex(roi_radius, control_vertex, ring_list); // currently using radius == 3, for region of mesh to affect
-		  // color the vertices in roi, red
-		  for (int i = 0; i < ring_list.size(); i++)
-		  {
-			  C.row(ring_list[i]->id()) = Eigen::RowVector3d(1, 0, 0); 
-		  }
-		  viewer.data.set_colors(C);
-
+		  
+		  vertex_descriptor control_vertex;
 		  mesh_deformation::Point point_1;
+
+		  control_vertex = *CGAL::cpp11::next(vb, last_vid);
 		  deform_mesh->insert_control_vertex(control_vertex, point_1);
+
+		  C.row(last_vid) = Eigen::RowVector3d(1, 0, 0);
+		  viewer.data.set_colors(C);
+		  // The definition of the ROI and the control vertex is done, call preprocess
+		  bool is_matrix_factorization_OK = deform_mesh->preprocess();
+		  if (!is_matrix_factorization_OK) {
+			  std::cerr << "Error in preprocessing, check documentation of preprocess()" << std::endl;
+			  return 0;
+		  }
+
 		  return true;
     }
 	else 
