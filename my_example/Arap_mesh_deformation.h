@@ -1,10 +1,9 @@
 #ifndef ARAP_MESH_DEFORMATION_H
 #define ARAP_MESH_DEFORMATION_H
 
-#include <CGAL/config.h>
-#include <CGAL/Default.h>
-#include <CGAL/tuple.h>
-#include <CGAL/Simple_cartesian.h>
+
+
+#include <iostream>
 #include <thread>
 #include <future>
 #include <mutex>
@@ -12,31 +11,35 @@
 #include <list>
 #include <utility>
 #include <limits>
-#include <boost/foreach.hpp>
-#include <CGAL/boost/graph/helpers.h>
-#include <CGAL/Kernel/global_functions_3.h>
-#include <CGAL/property_map.h>
-#include <CGAL/Eigen_solver_traits.h>
-#include <CGAL/FPU_extension.h>
 #include <Eigen/Eigen>
 #include <Eigen/SVD>
+#include<Eigen/SparseLU>
 
 
-template < class Triangle_mesh >
+class Timer
+{
+public:
+	Timer() : beg_(clock_::now()) {}
+	void reset() { beg_ = clock_::now(); }
+	double elapsed() const {
+		return std::chrono::duration_cast<second_>
+			(clock_::now() - beg_).count();
+	}
+
+private:
+	typedef std::chrono::high_resolution_clock clock_;
+	typedef std::chrono::duration<double, std::ratio<1> > second_;
+	std::chrono::time_point<clock_> beg_;
+};
+
+
 class Arap_mesh_deformation
 {
 
 public:
 
-	typedef typename CGAL::Eigen_solver_traits< Eigen::SparseLU< CGAL::Eigen_sparse_matrix<double>::EigenType, Eigen::COLAMDOrdering<int> > > Sparse_linear_solver;
-	typedef typename boost::property_map<Triangle_mesh, CGAL::vertex_point_t>::type Vertex_point_map;
-	typedef typename boost::graph_traits<Triangle_mesh>::vertex_descriptor vertex_descriptor;
-	typedef typename boost::graph_traits<Triangle_mesh>::halfedge_descriptor halfedge_descriptor;
-	typedef typename boost::property_traits<Vertex_point_map>::value_type Point;
-	typedef typename boost::graph_traits<Triangle_mesh>::vertex_iterator vertex_iterator;
-	typedef typename boost::graph_traits<Triangle_mesh>::halfedge_iterator halfedge_iterator;
-	typedef typename boost::graph_traits<Triangle_mesh>::in_edge_iterator in_edge_iterator;
-	typedef typename boost::graph_traits<Triangle_mesh>::out_edge_iterator out_edge_iterator;
+	typedef Eigen::SparseLU< Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int> > Sparse_linear_solver;
+
 	typedef typename Eigen::Matrix3d CR_matrix;
 	typedef typename Eigen::Vector3d CR_vector;
 
@@ -44,83 +47,83 @@ public:
 	double avg_rotation_time;
 private:
 
-	Triangle_mesh& triangle_mesh;
-
 	std::mutex mtex;
 
-	std::vector<Point> original;
-	std::vector<Point> solution;
+	Eigen::MatrixXd& vertices;
+	Eigen::MatrixXi& triangles;
 
-	std::vector<vertex_descriptor> roi; // region of interest
-	std::vector<vertex_descriptor> ros; // region of solution
+	std::vector<Eigen::Vector3d> original;
+	std::vector<Eigen::Vector3d> solution;
 
+	std::vector<std::size_t> roi; // region of interest
+	std::vector<std::size_t> ros; // region of solution
+
+	std::map<std::size_t, std::size_t> ros_to_original_map;
 	std::vector<std::size_t> ros_id_map;
 	std::vector<bool>        is_roi_map;
 	std::vector<bool>        is_ctrl_map;
 
-	std::vector<double> halfedge_weights;
+	Eigen::MatrixXd e_weights;
+	std::thread *weighting_thread;
+	std::vector<std::vector<int>> adjacent_vertices;
 	std::vector<CR_matrix> rotation_matrix;
 	Sparse_linear_solver linear_solver;
-	Vertex_point_map vertex_point_map;
-	typename Sparse_linear_solver::Matrix *A;
-
+	std::vector< Eigen::Triplet<double> > tripletList;
+	Eigen::SparseMatrix<double> *A;
+	const typename Eigen::SparseMatrix<double> *tmp;
 	bool preprocess_successful;
 	bool is_ids_cal_done;
 	bool factorization_done;
 
 public:
 
-  Arap_mesh_deformation(Triangle_mesh& t_mesh): triangle_mesh(t_mesh)
+  Arap_mesh_deformation(Eigen::MatrixXd &V, Eigen::MatrixXi &F): vertices(V),triangles(F)
   {
-	  ros_id_map = std::vector<std::size_t>(num_vertices(t_mesh), (std::numeric_limits<std::size_t>::max)());
-	  is_roi_map = std::vector<bool>(num_vertices(t_mesh), false);
-	  is_ctrl_map = std::vector<bool>(num_vertices(t_mesh), false);
-	  vertex_point_map = get(CGAL::vertex_point, t_mesh);// initialize a map of 3d_points
+	  
+	  ros_id_map = std::vector<std::size_t>(vertices.rows(), (std::numeric_limits<std::size_t>::max)());
+	  is_roi_map = std::vector<bool>(vertices.rows(), false);
+	  is_ctrl_map = std::vector<bool>(vertices.rows(), false);
 	  preprocess_successful = false;
 	  is_ids_cal_done = false;
 	  factorization_done = false;
-	  halfedge_iterator eb, ee;
-	  halfedge_weights.reserve(2 * num_edges(t_mesh)); // 2x because of halfedges
-	  for (CGAL::cpp11::tie(eb, ee) = halfedges(t_mesh); eb != ee; ++eb)
-	  {
-		  halfedge_weights.push_back(calculate_weight(*eb));
-	  }
 	  avg_rotation_time = 0.0;
 	  avg_solver_time = 0.0;
+	  //cal_weights();
+	  weighting_thread = new std::thread(&Arap_mesh_deformation::cal_weights, this);
+	  
   }
 
-  bool insert_control_vertex(vertex_descriptor vd, CGAL::Simple_cartesian<double>::Point_3 &point)
+  bool insert_control_vertex(int vid, Eigen::Vector3d &point)
   {
 	  // factorization needs to be done again once this function is called.
-	  if (is_control_vertex(vd)) 
+	  if (is_control_vertex(vid)) 
 	  { 
 		  return false; 
 	  }
 	  factorization_done = false;
-	  insert_roi_vertex(vd); // also insert it in region of interest
+	  insert_roi_vertex(vid); // also insert it in region of interest
 
-	  is_ctrl_map[get_vertex_id(vd)] = true;
-	  point = get(vertex_point_map, vd);
+	  is_ctrl_map[vid] = true;
 	  return true;
   }
 
-  void insert_roi_vertices(vertex_iterator begin, vertex_iterator end)
+  void insert_roi_vertices(int begin, int end)
   {
-	  for (; begin != end; ++begin)
+	  for (; begin <= end; ++begin)
 	  {
-		  insert_roi_vertex(*begin);
+		  insert_roi_vertex(begin);
 	  }
   }
 
-  bool insert_roi_vertex(vertex_descriptor vd)
+  bool insert_roi_vertex(int vid)
   {
-	  if (is_roi_vertex(vd)) 
+	  if (is_roi_vertex(vid)) 
 	  { 
 		  return false; 
 	  }
 
-	  is_roi_map[get_vertex_id(vd)] = true;
-	  roi.push_back(vd);
+	  is_roi_map[vid] = true;
+	  roi.push_back(vid);
 	  return true;
   }
 
@@ -131,19 +134,19 @@ public:
 	  init_ids_and_rotations();
 	  calculate_laplacian_and_factorize();
 	  double t = tmr.elapsed();
-	  std::cout << "Preprocess Time: " << t << std::endl;
 	  return preprocess_successful;
   }
 
-  void set_target_position(vertex_descriptor vd, const Point& target_position)
+  //void set_target_position(vertex_descriptor vd, const Point& target_position)
+  void set_target_position(int vid, const Eigen::Vector3d& target_position)
   {	  
 	  // ids should have been assigned before calling this function
 	  init_ids_and_rotations();
-	  if (!is_control_vertex(vd)) 
+	  if (!is_control_vertex(vid)) 
 	  { 
 		  return; 
 	  }
-	  solution[get_ros_id(vd)] = target_position; // target position directly goes to solution set, coz no calculation needed
+	  solution[get_ros_id(vid)] = target_position; // target position directly goes to solution set, coz no calculation needed
   }
 
   void deform(unsigned int iterations, double tolerance)
@@ -159,6 +162,7 @@ public:
 	  for (unsigned int ite = 0; ite < iterations; ++ite)
 	  {
 		  itrs+=1;
+		  Timer tmr;
 		  calculate_target_positions();
 		  calculate_optimal_rotations();
 		  if (tolerance > 0.0 && (ite + 1) < iterations)
@@ -174,126 +178,125 @@ public:
 				  }
 			  }
 		  }
+		  double t = tmr.elapsed();
+
 	  }
 	  avg_rotation_time = avg_rotation_time / double(itrs);
 	  avg_solver_time = avg_solver_time / double(itrs);
-
-	  std::cout << "Iterations Count: " << itrs << std::endl;
-	  std::cout << "Avg. Solver Time:  " << avg_solver_time << "    Avg. Rotation Time:  " << avg_rotation_time << std::endl;
 
 	  for (std::size_t i = 0; i < ros.size(); ++i) {
 		  std::size_t v_id = get_ros_id(ros[i]);
 		  if (is_roi_vertex(ros[i]))
 		  {
-			  put(vertex_point_map, ros[i], solution[v_id]); // assign new deformed positions to actual mesh vertices using vertex_descriptors
+			  vertices.row(ros[i]) = Eigen::RowVector3d(solution[v_id](0), solution[v_id](1), solution[v_id](2));
 		  }
 	  }
   }
 
 
-  bool is_roi_vertex(vertex_descriptor vd) const
+  //bool is_roi_vertex(vertex_descriptor vd) const
+  bool is_roi_vertex(int vid) const
   {
-	  return is_roi_map[get_vertex_id(vd)];
+	  return is_roi_map[vid];
   }
 
 
-  bool is_control_vertex(vertex_descriptor vd) const
+  //bool is_control_vertex(vertex_descriptor vd) const
+  bool is_control_vertex(int vid) const
   {
-	  return is_ctrl_map[get_vertex_id(vd)];
-  }
-
-  void generate_roi_recursive(int curr_radius, int max_radius, vertex_descriptor vd, std::vector<vertex_descriptor>& list)
-  {
-	  
-	  if (!is_roi_vertex(vd)) 
-	  {
-		  insert_roi_vertex(vd);
-		  list.push_back(vd);
-	  }
-
-	  if (curr_radius < max_radius)// if max_radius reached, then don't make a call for vertex's one ring neighbours
-	  {
-		  curr_radius += 1;
-		  in_edge_iterator e, e_end;
-		  for (CGAL::cpp11::tie(e, e_end) = in_edges(vd, triangle_mesh); e != e_end; e++) // loop on one-ring neighbours
-		  {
-			  vertex_descriptor vt = source(*e, triangle_mesh);
-			  generate_roi_recursive(curr_radius, max_radius, vt, list);
-		  }
-	  }
-  }
-
-  void generate_roi_from_vertex(int max_radius, vertex_descriptor vd, std::vector<vertex_descriptor>& list)
-  {
-	  generate_roi_recursive(0, max_radius, vd, list);
+	  return is_ctrl_map[vid];
   }
 
   void reset()
   {
 	  if (roi.empty()) { return; } // no ROI to reset
 
-	  //region_of_solution(); // not doing it coz roi is always the same, also my version of this function would modify the original array
-
-	  //restore the current positions to be the original positions
-	  BOOST_FOREACH(vertex_descriptor vd, roi)
+	//restore the current positions to be the original positions
+	  for (int i = 0; i < ros.size(); i++)
 	  {
-		  put(vertex_point_map, vd, original[get_ros_id(vd)]);
-		  solution[get_ros_id(vd)] = original[get_ros_id(vd)];
+		  std::size_t v_id = get_ros_id(ros[i]);
+		  vertices.row(ros[i]) = Eigen::RowVector3d(original[v_id](0), original[v_id](1), original[v_id](2));
+		  solution[v_id] = original[v_id];
 	  }
-
+	  
 	  // also set rotation matrix to identity
 	  std::fill(rotation_matrix.begin(), rotation_matrix.end(), CR_matrix().setIdentity());
 	  avg_rotation_time = 0.0;
 	  avg_solver_time = 0.0;
+
+  }
+
+  bool double_equals(double a, double b, double epsilon = 0.001)
+  {
+	  return std::abs(a - b) < epsilon;
+  }
+
+  void set_mesh_data(Eigen::MatrixXd &V, Eigen::MatrixXi &F)
+  {
+	  vertices = V;
+	  triangles = F;
+  }
+
+  void cal_weights()
+  {
+	  Timer tmr;
+	  adjacent_vertices.resize(vertices.rows());
+	  e_weights.resize(vertices.rows(), vertices.rows());
+	  e_weights.setConstant(-1);
+	  Eigen::Matrix<int, 3, 3> edges;
+	  edges <<
+		  1, 2, 0,
+		  2, 0, 1,
+		  0, 1, 2;
+
+	  for (int i = 0; i < triangles.rows(); i++)
+	  {
+		  for (int e = 0; e<edges.rows(); e++)
+		  {
+			  int v0 = triangles(i, edges(e, 0)); // considering v0-v1 is the edge being considered
+			  int v1 = triangles(i, edges(e, 1));
+			  int v2 = triangles(i, edges(e, 2));
+			  double res = get_cot(v0, v2, v1, vertices);
+
+			  if (e_weights(v0, v1) == -1)
+			  {
+				  e_weights(v0, v1) = (res / 2.0);
+				  e_weights(v1, v0) = (res / 2.0);
+			  }
+			  else
+			  {
+				  e_weights(v0, v1) = (((e_weights(v0, v1) * 2.0) + res) / 2.0);
+				  e_weights(v1, v0) = (((e_weights(v1, v0) * 2.0) + res)/2.0);
+			  }
+
+			  if (std::find(adjacent_vertices[v0].begin(), adjacent_vertices[v0].end(), v1) == adjacent_vertices[v0].end())
+			  {
+				  adjacent_vertices[v0].push_back(v1);
+				  adjacent_vertices[v1].push_back(v0);
+			  }
+
+		  }
+
+	  }
+	  double d = tmr.elapsed();
+
   }
 
   
 private:
-
-
-	double calculate_weight(halfedge_descriptor he)
-	{
-		vertex_descriptor v0 = target(he, triangle_mesh);
-		vertex_descriptor v1 = source(he, triangle_mesh);
-
-		if (is_border_edge(he, triangle_mesh))
-		{
-
-			halfedge_descriptor he_next = opposite(next(he, triangle_mesh), triangle_mesh);
-			vertex_descriptor v2 = source(he_next, triangle_mesh);
-			if (is_border_edge(he_next, triangle_mesh)) // if he and he_next both are border edges then they can't be part of same triangle, so check other end
-			{
-				halfedge_descriptor he_prev = prev(opposite(he, triangle_mesh), triangle_mesh);
-				v2 = source(he_prev, triangle_mesh);
-			}
-			return (get_cotangent_value(v0, v2, v1) / 2.0);
-		}
-		else
-		{
-			// for non-border edge both alpha and beta are available
-			halfedge_descriptor he_next = opposite(next(he, triangle_mesh), triangle_mesh);
-			vertex_descriptor v2 = source(he_next, triangle_mesh);
-			halfedge_descriptor he_prev = prev(opposite(he, triangle_mesh), triangle_mesh);
-			vertex_descriptor v3 = source(he_prev, triangle_mesh);
-
-			return ((get_cotangent_value(v0, v2, v1) + get_cotangent_value(v0, v3, v1)) / 2.0);
-		}
-	}
-
-
 	// Using Cotangent formula from: http://people.eecs.berkeley.edu/~jrs/meshpapers/MeyerDesbrunSchroderBarr.pdf
 	// Cot = cos/sin ==> using langrange's identity ==> a.b/sqrt(a^2 * b^2 - (a.b)^2)
-	double get_cotangent_value(vertex_descriptor v0, vertex_descriptor v1, vertex_descriptor v2)
+	double get_cot(int v0, int v1, int v2, Eigen::MatrixXd &V )
 	{
-		typedef CGAL::Simple_cartesian<double>::Vector_3 Vector;
+		typedef Eigen::Vector3d Vector;
 
-		Vector a = get(vertex_point_map, v0) - get(vertex_point_map, v1);
-		Vector b = get(vertex_point_map, v2) - get(vertex_point_map, v1);
+		Vector a(V(v0,0)-V(v1,0), V(v0, 1) - V(v1, 1), V(v0, 2) - V(v1, 2));
+		Vector b(V(v2, 0) - V(v1, 0), V(v2, 1) - V(v1, 1), V(v2, 2) - V(v1, 2));
 
-		double dot_ab = a*b;
+		double dot_ab = a.dot(b);
 
-		Vector cross_ab = CGAL::cross_product(a, b);
-		double divider = CGAL::sqrt(cross_ab*cross_ab);
+		Vector cross_ab = a.cross(b);
+		double divider = cross_ab.norm();  //CGAL::sqrt(cross_ab*cross_ab);
 
 		if (divider == 0)
 		{
@@ -303,50 +306,34 @@ private:
 		return (std::max)(0.0, (dot_ab / divider));
 	}
 
+	
+	
 	double compute_energy()
 	{
 
 		double sum_of_energy = 0;
 		for (std::size_t k = 0; k < ros.size(); k++)
 		{
-			vertex_descriptor vi = ros[k];
-			std::size_t vi_id = get_ros_id(vi);
-
-			in_edge_iterator e, e_end;
-			for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++)
+			std::size_t vi_id = get_ros_id(ros[k]);
+			std::vector<int> vec = adjacent_vertices[ros[k]];
+			double wij = 0;
+			double total_weight = 0;
+			for (int j = 0; j<vec.size(); j++)
 			{
-				halfedge_descriptor he = halfedge(*e, triangle_mesh);
-				vertex_descriptor vj = source(he, triangle_mesh);
-				std::size_t vj_id = get_ros_id(vj);
 
-				const CR_vector& pij = CR_vector(original[vi_id][0] - original[vj_id][0], original[vi_id][1] - original[vj_id][1], original[vi_id][2] - original[vj_id][2]);//sub_to_CR_vector(original[vi_id], original[vj_id]);
-				const CR_vector& qij = CR_vector(solution[vi_id][0] - solution[vj_id][0], solution[vi_id][1] - solution[vj_id][1], solution[vi_id][2] - solution[vj_id][2]);//sub_to_CR_vector(solution[vi_id], solution[vj_id]);
+				wij = e_weights(ros[k], vec[j]);
 
-				double wij = halfedge_weights[get_edge_id(he)];
+				std::size_t vj_id = get_ros_id(vec[j]);
+
+				const CR_vector& pij = CR_vector(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
+				const CR_vector& qij = CR_vector(solution[vi_id](0) - solution[vj_id](0), solution[vi_id](1) - solution[vj_id](1), solution[vi_id](2) - solution[vj_id](2));
 
 				sum_of_energy += wij * (qij - rotation_matrix[vi_id] * pij).squaredNorm();
-
 			}
+
 		}
 		return sum_of_energy;
 	}
-
-
-  void assign_ros_id_to_one_ring(vertex_descriptor vd, std::size_t& next_id, std::vector<vertex_descriptor>& push_vector)
-  {
-    in_edge_iterator e, e_end;
-    for (CGAL::cpp11::tie(e,e_end) = in_edges(vd, triangle_mesh); e != e_end; e++)
-    {
-      vertex_descriptor vt = source(*e, triangle_mesh);
-      if(get_ros_id(vt) == (std::numeric_limits<std::size_t>::max)())
-      {
-        get_ros_id(vt) = next_id++;
-        push_vector.push_back(vt);
-      }
-    }
-  }
-
-
  
   void init_ids_and_rotations() // Assuming we are using whole mesh in ROI
   {
@@ -358,7 +345,7 @@ private:
     ros.clear(); 
     ros.insert(ros.end(), roi.begin(), roi.end());
 
-    ros_id_map.assign(num_vertices(triangle_mesh), (std::numeric_limits<std::size_t>::max)()); // assign max to represent invalid value
+    ros_id_map.assign(vertices.rows(), (std::numeric_limits<std::size_t>::max)()); // assign max to represent invalid value
 
     for(std::size_t i = 0; i < roi.size(); i++)  
     { 
@@ -378,40 +365,10 @@ private:
 	for (std::size_t i = 0; i < ros.size(); i++)
 	{
 		std::size_t v_ros_id = get_ros_id(ros[i]);
-		solution[v_ros_id] = get(vertex_point_map, ros[i]);
-		original[v_ros_id] = get(vertex_point_map, ros[i]);
+		solution[v_ros_id] = vertices.row(ros[i]);
+		original[v_ros_id] = vertices.row(ros[i]);
 	}
 
-	//initialize_rotation_matrices();
-	//assign_initial_positions();
-
-	/*std::thread t1(&Arap_mesh_deformation::initialize_rotation_matrices, this);
-	std::thread t2(&Arap_mesh_deformation::assign_initial_positions, this);
-	t1.join();
-	t2.join();*/
-  }
-
-  void initialize_rotation_matrices()
-  {
-	  rotation_matrix.resize(ros.size());
-	  for (std::size_t i = 0; i < rotation_matrix.size(); i++)
-	  {
-		  std::size_t v_ros_id = get_ros_id(ros[i]);
-		  rotation_matrix[v_ros_id] = CR_matrix().setIdentity();
-	  }
-  }
-
-  void assign_initial_positions()
-  {
-	  solution.resize(ros.size());
-	  original.resize(ros.size());
-
-	  for (std::size_t i = 0; i < ros.size(); i++)
-	  {
-		  std::size_t v_ros_id = get_ros_id(ros[i]);
-		  solution[v_ros_id] = get(vertex_point_map, ros[i]);
-		  original[v_ros_id] = get(vertex_point_map, ros[i]);
-	  }
   }
 
   /// Construct matrix that corresponds to left-hand side of eq:lap_ber == LP' = b and 
@@ -421,77 +378,48 @@ private:
 	  if (factorization_done)
 		  return;
 	  factorization_done = true;
-	  //typename Sparse_linear_solver::Matrix A(ros.size());
-	  A = new typename Sparse_linear_solver::Matrix(ros.size());
+	  if (weighting_thread->joinable())
+		  weighting_thread->join();
+	  size_t siz = ros.size();
+	  A = new Eigen::SparseMatrix<double>(static_cast<int>(siz), static_cast<int>(siz));
+	  tripletList.reserve(siz);
 	  std::vector<std::thread> threds;
 	  for (std::size_t k = 0; k < ros.size(); k++)
 	  {
-		  vertex_descriptor vi = ros[k];
-		  std::size_t vi_id = get_ros_id(vi);
-		  if (is_roi_vertex(vi) && !is_control_vertex(vi))
+		  std::size_t vi_id = get_ros_id(ros[k]);
+		  if (is_roi_vertex(ros[k]) && !is_control_vertex(ros[k]))
 		  {
 			  double diagonal_val = 0;
-			  in_edge_iterator e, e_end;
-			  for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++) // loop over 1-ring
+			  std::vector<int> vec = adjacent_vertices[ros[k]];
+			  double wij = 0;
+			  double total_weight = 0;
+			  for (int j = 0; j<vec.size(); j++)
 			  {
-				  halfedge_descriptor he = halfedge(*e, triangle_mesh);
-				  vertex_descriptor vj = source(he, triangle_mesh);
-				  double wij = halfedge_weights[get_edge_id(he)];
-				  double wji = halfedge_weights[get_edge_id(opposite(he, triangle_mesh))];
-				  double total_weight = wij + wji;
 
-				  //set_mat_coef(vi_id, get_ros_id(vj), -total_weight);
-				  A->set_coef(vi_id, get_ros_id(vj), -total_weight, true); // for non-diagonal entries, value is -(wij+wji)
+				  wij = e_weights(ros[k], vec[j]);
+
+				  total_weight = wij + wij; // As wij == wji
+				  tripletList.push_back(Eigen::Triplet<double, int>(vi_id, get_ros_id(vec[j]), -total_weight));
 				  diagonal_val += total_weight;
 			  }
-
-			  A->set_coef(vi_id, vi_id, diagonal_val, true);
-			  //set_mat_coef(vi_id, vi_id, diagonal_val);
-			  //threds.push_back(std::thread(&Arap_mesh_deformation::setup_mat_for_non_ctrl, this, vi, vi_id));
+			 
+			  tripletList.push_back(Eigen::Triplet<double, int>(vi_id, vi_id, diagonal_val));
 		  }
 		  else
 		  {
-			  //set_mat_coef(vi_id, vi_id, 1.0);
-			  A->set_coef(vi_id, vi_id, 1.0, true); // for control vertices just set to 1 coz their target position comes from user
+			  tripletList.push_back(Eigen::Triplet<double, int>(vi_id, vi_id, 1.0));
 		  }
 	  }
-
-	  /*for (auto& th : threds) {
-		  th.join();
-	  }*/
 	  
+	  A->setFromTriplets(tripletList.begin(), tripletList.end());
+	  tripletList.clear();
 	  double D;
-	  preprocess_successful = linear_solver.factor(*A, D);
+	  A->makeCompressed();
+	  tmp = A;
+	  linear_solver.compute(*tmp);
+	  preprocess_successful = (linear_solver.info() == Eigen::Success);
   }
   
-  void setup_mat_for_non_ctrl(vertex_descriptor vi, std::size_t vi_id)
-  {
-	  double diagonal_val = 0;
-	  in_edge_iterator e, e_end;
-	  for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++) // loop over 1-ring
-	  {
-		  halfedge_descriptor he = halfedge(*e, triangle_mesh);
-		  vertex_descriptor vj = source(he, triangle_mesh);
-		  double wij = halfedge_weights[get_edge_id(he)];
-		  double wji = halfedge_weights[get_edge_id(opposite(he, triangle_mesh))];
-		  double total_weight = wij + wji;
-
-		  set_mat_coef(vi_id, get_ros_id(vj), -total_weight);
-		  //A->set_coef(vi_id, get_ros_id(vj), -total_weight, true); // for non-diagonal entries, value is -(wij+wji)
-		  diagonal_val += total_weight;
-	  }
-
-	  set_mat_coef(vi_id, vi_id, diagonal_val);
-	  //A->set_coef(vi_id, vi_id, diagonal_val, true); // diagonal entries are sum of all others(1-ring) in this row
-  }
-
-  void set_mat_coef(size_t row, size_t column, double val)
-  {
-	  mtex.lock();
-	  if (A != NULL)
-		  A->set_coef(row, column, val, true);
-	  mtex.unlock();
-  }
 
   // Covariance matrix S = SumOverOneRing(wij * pij * qij.transpose)
   void calculate_optimal_rotations()
@@ -501,25 +429,22 @@ private:
 	  std::vector<std::thread> threds;
 	  for (std::size_t k = 0; k < ros.size(); k++)
 	  {
-		  vertex_descriptor vi = ros[k];
-		  std::size_t vi_id = get_ros_id(vi);
+		  std::size_t vi_id = get_ros_id(ros[k]);
 
 		  cov = CR_matrix().setZero();
-
-		  in_edge_iterator e, e_end;
-
-		  for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++)
+		  
+		  std::vector<int> vec = adjacent_vertices[ros[k]];
+		  double wij = 0;
+		  double total_weight = 0;
+		  for (int j = 0; j<vec.size(); j++)
 		  {
-			  halfedge_descriptor he = halfedge(*e, triangle_mesh);
-			  vertex_descriptor vj = source(he, triangle_mesh);
-			  std::size_t vj_id = get_ros_id(vj);
+			  wij = e_weights(ros[k], vec[j]);
 
-			  const CR_vector& pij = CR_vector(original[vi_id][0] - original[vj_id][0], original[vi_id][1] - original[vj_id][1], original[vi_id][2] - original[vj_id][2]);
-			  const CR_vector& qij = CR_vector(solution[vi_id][0] - solution[vj_id][0], solution[vi_id][1] - solution[vj_id][1], solution[vi_id][2] - solution[vj_id][2]);
-			  double wij = halfedge_weights[get_edge_id(he)];
+			  std::size_t vj_id = get_ros_id(vec[j]);
 
+			  const CR_vector& pij = CR_vector(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
+			  const CR_vector& qij = CR_vector(solution[vi_id](0) - solution[vj_id](0), solution[vi_id](1) - solution[vj_id](1), solution[vi_id](2) - solution[vj_id](2));
 			  cov += wij * (pij * qij.transpose());
-
 		  }
 		
 		  threds.push_back(std::thread(&Arap_mesh_deformation::compute_close_rotation, this, cov, std::ref(rotation_matrix[vi_id])));
@@ -534,44 +459,43 @@ private:
 
   void calculate_target_positions()
   {
-	  typename Sparse_linear_solver::Vector X(ros.size()), Bx(ros.size());
-	  typename Sparse_linear_solver::Vector Y(ros.size()), By(ros.size());
-	  typename Sparse_linear_solver::Vector Z(ros.size()), Bz(ros.size());
+
+	  typename Eigen::VectorXd X(ros.size()), Bx(ros.size());
+	  typename Eigen::VectorXd Y(ros.size()), By(ros.size());
+	  typename Eigen::VectorXd Z(ros.size()), Bz(ros.size());
 
 
 	  for (std::size_t k = 0; k < ros.size(); k++)
 	  {
-		  vertex_descriptor vi = ros[k];
-		  std::size_t vi_id = get_ros_id(vi);
+		  std::size_t vi_id = get_ros_id(ros[k]);
 
-		  if (is_roi_vertex(vi) && !is_control_vertex(vi))
+		  if (is_roi_vertex(ros[k]) && !is_control_vertex(ros[k]))
 		  {
 
 			  CR_vector xyz = CR_vector(0, 0, 0);
 
-			  in_edge_iterator e, e_end;
-			  for (CGAL::cpp11::tie(e, e_end) = in_edges(vi, triangle_mesh); e != e_end; e++)
+			  std::vector<int> vec = adjacent_vertices[ros[k]];
+			  double wij = 0;
+			  double total_weight = 0;
+			  for (int j = 0; j<vec.size(); j++)
 			  {
-				  halfedge_descriptor he = halfedge(*e, triangle_mesh);
-				  vertex_descriptor vj = source(he, triangle_mesh);
-				  std::size_t vj_id = get_ros_id(vj);
+				  wij = e_weights(ros[k], vec[j]);
 
-				  const CR_vector& pij = CR_vector(original[vi_id][0] - original[vj_id][0], original[vi_id][1] - original[vj_id][1], original[vi_id][2] - original[vj_id][2]);
-
-				  double wij = halfedge_weights[get_edge_id(he)];
-				  double wji = halfedge_weights[get_edge_id(opposite(he, triangle_mesh))];
-
+				  std::size_t vj_id = get_ros_id(vec[j]);
+				  const CR_vector& pij = CR_vector(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
+				  double wji = wij; // As wij == wji
 				  xyz += (wij * rotation_matrix[vi_id] + wji * rotation_matrix[vj_id]) * pij;
 			  }
+			  
 			  Bx[vi_id] = xyz(0);
 			  By[vi_id] = xyz(1);
 			  Bz[vi_id] = xyz(2);
 		  }
 		  else
 		  {		// control points's target positions are given by the user, so directly assign those values
-			  Bx[vi_id] = solution[vi_id][0]; 
-			  By[vi_id] = solution[vi_id][1]; 
-			  Bz[vi_id] = solution[vi_id][2];
+			  Bx[vi_id] = solution[vi_id](0); 
+			  By[vi_id] = solution[vi_id](1); 
+			  Bz[vi_id] = solution[vi_id](2);
 		  }
 	  }
 	  // Call solver for each dimension of the point seperately 
@@ -580,7 +504,6 @@ private:
 	  auto sol2 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(By), std::ref(Y));
 	  auto sol3 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(Bz), std::ref(Z));
 	  
-	  //bool is_all_solved = linear_solver.linear_solver(Bx, X) && linear_solver.linear_solver(By, Y) && linear_solver.linear_solver(Bz, Z);
 	  bool is_all_solved = sol1.get() && sol2.get() && sol3.get();
 
 	  avg_solver_time += tmr.elapsed();
@@ -593,38 +516,28 @@ private:
 	  for (std::size_t i = 0; i < ros.size(); i++)
 	  {
 		  std::size_t v_id = get_ros_id(ros[i]);
-		  Point p(X[v_id], Y[v_id], Z[v_id]);
-		  if (!is_ctrl_map[get_vertex_id(ros[i])])
+		  Eigen::Vector3d p(X[v_id], Y[v_id], Z[v_id]);
+		  if (!is_ctrl_map[ros[i]])
 			  solution[v_id] = p;
 	  }
   }
   
-  bool solver(Sparse_linear_solver::Vector& B, Sparse_linear_solver::Vector& X)
+  bool solver(Eigen::VectorXd& B, Eigen::VectorXd& X)
   {
-	  return linear_solver.linear_solver(B, X);
-  }
-
-  // Get original vertex id
-  std::size_t get_vertex_id(vertex_descriptor vd) const
-  { 
-	  return vd->id();
+	  X = linear_solver.solve(B);
+	  return linear_solver.info() == Eigen::Success;
   }
 
   // get ros_id as L value
-  std::size_t& get_ros_id(vertex_descriptor vd)
+  std::size_t& get_ros_id(int vid)
   { 
-	  return ros_id_map[get_vertex_id(vd)]; 
+	  return ros_id_map[vid]; 
   }
 
   // get ros_id as R value
-  std::size_t  get_ros_id(vertex_descriptor vd) const
+  std::size_t  get_ros_id(int vid) const
   {
-	  return ros_id_map[get_vertex_id(vd)];
-  }
-  // get half edge id
-  std::size_t get_edge_id(halfedge_descriptor e) const
-  {
-	  return e->id();
+	  return ros_id_map[vid];
   }
 
   // Calculate the closest rotation, which according to paper is : R = V*(identity_mtrix with last element == det(V*U.transpose()))*U.transpose()
@@ -668,9 +581,8 @@ private:
 	  const Scalar th = std::sqrt(Eigen::NumTraits<Scalar>::dummy_precision());
 
 	  Eigen::SelfAdjointEigenSolver<CR_matrix> eig;
-	  CGAL::feclearexcept(FE_UNDERFLOW);
 	  eig.computeDirect(A.transpose()*A);
-	  if (CGAL::fetestexcept(FE_UNDERFLOW) || eig.eigenvalues()(0) / eig.eigenvalues()(2)<th)
+	  if (eig.eigenvalues()(0) / eig.eigenvalues()(2)<th)
 	  {
 		  return false;
 	  }
