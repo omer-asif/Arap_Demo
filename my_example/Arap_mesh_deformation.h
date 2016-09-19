@@ -167,7 +167,7 @@ public:
 			Timer tmr;
 			
 			if (ite != 0)
-				calculate_target_positions(true);
+				calculate_target_positions(true); // apply acceleration
 			else
 				calculate_target_positions(false);
 
