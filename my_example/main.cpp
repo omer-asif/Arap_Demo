@@ -4,7 +4,6 @@
 #include <fstream>
 #include <iostream>
 #include <chrono>
-
 #include <igl/readOFF.h>
 #include <igl/unproject.h>
 #include <igl/unproject_onto_mesh.h>
@@ -18,6 +17,8 @@
 #define DEFORMED_MESH_PATH "deformed_mesh.off"
 
 typedef Arap_mesh_deformation mesh_deformation;
+
+std::mutex mtex;
 
 mesh_deformation *deform_mesh = NULL;
 Eigen::MatrixXd V, V_temp, C;
@@ -39,50 +40,41 @@ bool setup_mesh_for_deformation(const char* filename, Eigen::MatrixXd &V, Eigen:
 	return true;
 }
 
-void update_ui()
-{
-	viewer.data.set_vertices(V_temp);
-	viewer.data.set_colors(C);
-}
-
 void perform_deformation()
 {
-	Timer tmr;
-	flag = true;
-	std::vector<std::thread> lst;
-	for (int l = 0; l < 20; l++)
+	bool stop_loop = false;
+	while (!stop_loop)
 	{
 		deform_mesh->deform(1, 0.0);
-		if(l%2 == 0 && l!=0)
-			lst.push_back(std::thread(update_ui));
+		V = V_temp;
+		viewer.data.set_vertices(V);
+		mtex.lock();
+		if (flag == false)
+			stop_loop = true;
+		mtex.unlock();
 	}
-	igl::writeOFF(DEFORMED_MESH_PATH, V, F);
+	
+}
 
-	// Reset everything to start again using the deformed mesh
+void stop_thread()
+{
+	mtex.lock();
+	flag = false;
+	mtex.unlock();
 	last_vid = -1;
 	V = V_temp;
 	viewer.data.set_vertices(V);
-	viewer.data.set_colors(C);
-	deform_mesh->reset();
-	double t = tmr.elapsed();
-	for (auto&th : lst)
-	{
-		th.join();
-	}
-	std::cout << "Total Elapsed Time: " << t << std::endl; // Time Elapsed
-	flag = false;
+	
 }
-
 
 int main(int argc, char *argv[])
 {
+
   float original_z = 0.0f;
   bool clicked_outside_mesh = true;
   
   std::thread *deformation_thread = NULL;
   std::map<int, Eigen::Vector3d> id_point_map;
-
-  
 
   igl::readOFF(ORIGINAL_MESH_PATH, V, F);
 
@@ -90,10 +82,9 @@ int main(int argc, char *argv[])
   F_temp = F;
 
   // Initialize with white color
-  C= Eigen::MatrixXd::Constant(V.rows(),3,1); // Initialize Color matrix with size of Vertices, for per vertex coloring, white by default
+  C= Eigen::MatrixXd::Constant(V.rows(),3,1); 
   
 
-  //Polyhedron mesh;
   if (!setup_mesh_for_deformation(ORIGINAL_MESH_PATH, V_temp, F_temp))
   {
 	  return 1; // error occured, exit the program
@@ -103,34 +94,27 @@ int main(int argc, char *argv[])
   viewer.callback_mouse_up =
 	  [&](igl::viewer::Viewer& viewer, int btn, int)->bool 
   {
-	  if (flag) {
-		  return false;
-	  }
 	  if (last_vid != -1 && !clicked_outside_mesh)
 	  {
-		  GLint x = viewer.current_mouse_x; 
-		  GLfloat y = viewer.core.viewport(3) - viewer.current_mouse_y;
-		 		 
-		  Eigen::Vector3f win_d(x, y, original_z); // using screen z value from initial mouse click down, current z gives wrong output
-		  Eigen::Vector3f ss;
-		  Eigen::Matrix4f mvv = viewer.core.view * viewer.core.model;
-		  ss = igl::unproject(win_d, mvv, viewer.core.proj, viewer.core.viewport); // convert current mouse pos,from screen to object coordinates
+		GLint x = viewer.current_mouse_x; 
+		GLfloat y = viewer.core.viewport(3) - viewer.current_mouse_y;
+		  		 
+		Eigen::Vector3f win_d(x, y, original_z);
+		Eigen::Vector3f ss;
+		Eigen::Matrix4f mvv = viewer.core.view * viewer.core.model;
+		ss = igl::unproject(win_d, mvv, viewer.core.proj, viewer.core.viewport);
 		  
 		  
-		  // Set target positions of control vertices
+		id_point_map[last_vid] = Eigen::Vector3d(ss.x(), ss.y(), ss.z());
+		  
+		deform_mesh->set_target_position(last_vid, id_point_map[last_vid]);
 
-		  id_point_map[last_vid] = Eigen::Vector3d(ss.x(), ss.y(), ss.z());
-		  
-		 // Have to set target positions for all ctrls coz during reset we lost these positions 
-		 for (std::map<int, Eigen::Vector3d>::iterator ii = id_point_map.begin(); ii != id_point_map.end(); ++ii)
-		  {
-			 deform_mesh->set_target_position(ii->first,ii->second);
-		  }
-		 
-		  Timer tmr;
-		  deformation_thread = new std::thread(perform_deformation);
+		mtex.lock();
+		flag = true;
+		mtex.unlock();
+		deformation_thread = new std::thread(perform_deformation);
 
-		  return true;
+		return true;
 	  }
 	  return false;
   };
@@ -139,11 +123,6 @@ int main(int argc, char *argv[])
   viewer.callback_mouse_down = 
     [&](igl::viewer::Viewer& viewer, int btn, int)->bool
   {
-	
-	if (flag) {
-		return false;
-	}
-
 	int face_id;
     Eigen::Vector3f bc;
 	
@@ -163,25 +142,24 @@ int main(int argc, char *argv[])
       face_id,
       bc))
     {
-		  clicked_outside_mesh = false;
-		  int i;
-		  bc.maxCoeff(&i);
-		  last_vid = F(face_id, i); // retrieve the vertex id clicked by using the retrieved face_id
-		  Eigen::Vector3d point_1;
+		stop_thread();
+		clicked_outside_mesh = false;
+		int i;
+		bc.maxCoeff(&i);
+		last_vid = F(face_id, i); // retrieve the vertex id clicked by using the retrieved face_id
 
-		  //control_vertex = *CGAL::cpp11::next(vb, last_vid);
-		  deform_mesh->insert_control_vertex(last_vid, point_1);
+		deform_mesh->insert_control_vertex(last_vid);
 
-		  C.row(last_vid) = Eigen::RowVector3d(1, 0, 0);
-		  viewer.data.set_colors(C);
-		  // The definition of the ROI and the control vertex is done, call preprocess
-		  bool is_matrix_factorization_OK = deform_mesh->preprocess();
-		  if (!is_matrix_factorization_OK) {
-			  std::cerr << "Error in preprocessing, check documentation of preprocess()" << std::endl;
-			  return 0;
-		  }
+		C.row(last_vid) = Eigen::RowVector3d(1, 0, 0);
+		viewer.data.set_colors(C);
+		// The definition of the ROI and the control vertex is done, call preprocess
+		bool is_matrix_factorization_OK = deform_mesh->preprocess();
+		if (!is_matrix_factorization_OK) {
+			std::cerr << "Error in preprocessing" << std::endl;
+			return 0;
+		}
 
-		  return true;
+		return true;
     }
 	else 
 	{
