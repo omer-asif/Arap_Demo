@@ -1,8 +1,6 @@
 #ifndef ARAP_MESH_DEFORMATION_H
 #define ARAP_MESH_DEFORMATION_H
 
-
-
 #include <iostream>
 #include <thread>
 #include <future>
@@ -15,67 +13,40 @@
 #include <Eigen/SVD>
 #include<Eigen/SparseLU>
 
-class Timer
-{
-public:
-	Timer() : beg_(clock_::now()) {}
-	void reset() { beg_ = clock_::now(); }
-	double elapsed() const {
-		return std::chrono::duration_cast<second_>
-			(clock_::now() - beg_).count();
-	}
-
-private:
-	typedef std::chrono::high_resolution_clock clock_;
-	typedef std::chrono::duration<double, std::ratio<1> > second_;
-	std::chrono::time_point<clock_> beg_;
-};
-
-
+// Class to perform ARAP Mesh Deformation on triangular meshes
 class Arap_mesh_deformation
 {
 
 public:
-
 	typedef Eigen::SparseLU< Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int> > Sparse_linear_solver;
-
 	double avg_solver_time;
 	double avg_rotation_time;
 private:
-
 	Eigen::MatrixXd& vertices;
 	Eigen::MatrixXi& triangles;
-
 	Eigen::VectorXd prev_X;
 	Eigen::VectorXd prev_Y;
 	Eigen::VectorXd prev_Z;
 	std::vector<Eigen::Vector3d> original;
 	std::vector<Eigen::Vector3d> solution;
-
 	std::vector<Eigen::Vector3d> prev_solution;
-	std::vector<Eigen::Vector3d> prev_2;
-
 	std::vector<std::size_t> roi; // region of interest
 	std::vector<std::size_t> ros; // region of solution
-
-	std::map<std::size_t, std::size_t> ros_to_original_map;
 	std::vector<std::size_t> ros_id_map;
 	std::vector<bool>        is_roi_map;
 	std::vector<bool>        is_ctrl_map;
 	std::vector<std::vector<int>> adjacent_vertices;
 	std::vector<Eigen::Matrix3d> rotation_matrix;
 	std::vector< Eigen::Triplet<double> > tripletList;
+	std::map<std::size_t, std::size_t> ros_to_original_map;
 	Eigen::MatrixXd e_weights;
 	std::thread *weighting_thread;
-	
 	Sparse_linear_solver linear_solver;
-	
 	Eigen::SparseMatrix<double> *A;
 	const typename Eigen::SparseMatrix<double> *tmp;
 	bool preprocess_successful;
 	bool is_ids_cal_done;
 	bool factorization_done;
-
 	double theta;
 
 
@@ -93,7 +64,6 @@ public:
 		avg_rotation_time = 0.0;
 		avg_solver_time = 0.0;
 		theta = 0.81; // for condition number=100, theta=0.81 and for condition number=1000, theta=0.938
-		//cal_weights();
 		weighting_thread = new std::thread(&Arap_mesh_deformation::cal_weights, this);
 	}
 
@@ -106,7 +76,6 @@ public:
 		}
 		factorization_done = false;
 		insert_roi_vertex(vid); // also insert it in region of interest
-
 		is_ctrl_map[vid] = true;
 		return true;
 	}
@@ -125,19 +94,15 @@ public:
 		{
 			return false;
 		}
-
 		is_roi_map[vid] = true;
 		roi.push_back(vid);
 		return true;
 	}
-
-
+	
 	bool preprocess()
 	{
-		Timer tmr;
 		init_ids_and_rotations();
 		calculate_laplacian_and_factorize();
-		double t = tmr.elapsed();
 		return preprocess_successful;
 	}
 
@@ -154,7 +119,6 @@ public:
 
 	void deform(unsigned int iterations, double tolerance)
 	{
-
 		if (!preprocess_successful) {
 			return;
 		}
@@ -164,13 +128,10 @@ public:
 		for (unsigned int ite = 0; ite < iterations; ++ite)
 		{
 			itrs += 1;
-			Timer tmr;
-			
 			if (ite != 0)
 				calculate_target_positions(true); // apply acceleration
 			else
 				calculate_target_positions(false);
-
 			calculate_optimal_rotations();
 			if (tolerance > 0.0 && (ite + 1) < iterations)
 			{
@@ -185,12 +146,7 @@ public:
 					}
 				}
 			}
-			double t = tmr.elapsed();
-
 		}
-		avg_rotation_time = avg_rotation_time / double(itrs);
-		avg_solver_time = avg_solver_time / double(itrs);
-
 		for (std::size_t i = 0; i < ros.size(); ++i) {
 			std::size_t v_id = get_ros_id(ros[i]);
 			if (is_roi_vertex(ros[i]))
@@ -215,21 +171,8 @@ public:
 	void reset()
 	{
 		if (roi.empty()) { return; } // no ROI to reset
-
-		//restore the current positions to be the original positions
-		/*for (int i = 0; i < ros.size(); i++)
-		{
-			std::size_t v_id = get_ros_id(ros[i]);
-			vertices.row(ros[i]) = Eigen::RowVector3d(original[v_id](0), original[v_id](1), original[v_id](2));
-			solution[v_id] = original[v_id];
-			prev_solution[v_id] = original[v_id];
-		}*/
-
-		// also set rotation matrix to identity
-		//std::fill(rotation_matrix.begin(), rotation_matrix.end(), Eigen::Matrix3d().setIdentity());
 		avg_rotation_time = 0.0;
 		avg_solver_time = 0.0;
-
 	}
 
 	bool double_equals(double a, double b, double epsilon = 0.001)
@@ -245,7 +188,6 @@ public:
 
 	void cal_weights()
 	{
-		Timer tmr;
 		adjacent_vertices.resize(vertices.rows());
 		e_weights.resize(vertices.rows(), vertices.rows());
 		e_weights.setConstant(-1);
@@ -254,7 +196,6 @@ public:
 			1, 2, 0,
 			2, 0, 1,
 			0, 1, 2;
-
 		for (int i = 0; i < triangles.rows(); i++)
 		{
 			for (int e = 0; e<edges.rows(); e++)
@@ -274,33 +215,24 @@ public:
 					e_weights(v0, v1) = (((e_weights(v0, v1) * 2.0) + res) / 2.0);
 					e_weights(v1, v0) = (((e_weights(v1, v0) * 2.0) + res) / 2.0);
 				}
-
 				if (std::find(adjacent_vertices[v0].begin(), adjacent_vertices[v0].end(), v1) == adjacent_vertices[v0].end())
 				{
 					adjacent_vertices[v0].push_back(v1);
 					adjacent_vertices[v1].push_back(v0);
 				}
-
 			}
-
 		}
-		double d = tmr.elapsed();
-
 	}
-
-
+	
 private:
 	// Using Cotangent formula from: http://people.eecs.berkeley.edu/~jrs/meshpapers/MeyerDesbrunSchroderBarr.pdf
 	// Cot = cos/sin ==> using langrange's identity ==> a.b/sqrt(a^2 * b^2 - (a.b)^2)
 	double get_cot(int v0, int v1, int v2, Eigen::MatrixXd &V)
 	{
 		typedef Eigen::Vector3d Vector;
-
 		Vector a(V(v0, 0) - V(v1, 0), V(v0, 1) - V(v1, 1), V(v0, 2) - V(v1, 2));
 		Vector b(V(v2, 0) - V(v1, 0), V(v2, 1) - V(v1, 1), V(v2, 2) - V(v1, 2));
-
 		double dot_ab = a.dot(b);
-
 		Vector cross_ab = a.cross(b);
 		double divider = cross_ab.norm(); 
 
@@ -308,14 +240,11 @@ private:
 		{
 			return 0.0;
 		}
-
 		return (std::max)(0.0, (dot_ab / divider));
 	}
 
-
 	double compute_energy()
 	{
-
 		double sum_of_energy = 0;
 		for (std::size_t k = 0; k < ros.size(); k++)
 		{
@@ -325,14 +254,10 @@ private:
 			double total_weight = 0;
 			for (int j = 0; j<vec.size(); j++)
 			{
-
 				wij = e_weights(ros[k], vec[j]);
-
 				std::size_t vj_id = get_ros_id(vec[j]);
-
 				const Eigen::Vector3d& pij = Eigen::Vector3d(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
 				const Eigen::Vector3d& qij = Eigen::Vector3d(solution[vi_id](0) - solution[vj_id](0), solution[vi_id](1) - solution[vj_id](1), solution[vi_id](2) - solution[vj_id](2));
-
 				sum_of_energy += wij * (qij - rotation_matrix[vi_id] * pij).squaredNorm();
 			}
 
@@ -342,32 +267,25 @@ private:
 
 	void init_ids_and_rotations() // Assuming we are using whole mesh in ROI
 	{
-
 		if (is_ids_cal_done)
 			return;
-
 		is_ids_cal_done = true;
 		ros.clear();
 		ros.insert(ros.end(), roi.begin(), roi.end());
-
 		ros_id_map.assign(vertices.rows(), (std::numeric_limits<std::size_t>::max)()); // assign max to represent invalid value
-
 		for (std::size_t i = 0; i < roi.size(); i++)
 		{
 			get_ros_id(roi[i]) = i;
 		}
-
 		rotation_matrix.resize(ros.size());
 		for (std::size_t i = 0; i < rotation_matrix.size(); i++)
 		{
 			std::size_t v_ros_id = get_ros_id(ros[i]);
 			rotation_matrix[v_ros_id] = Eigen::Matrix3d().setIdentity();
 		}
-		
 		prev_solution.resize(ros.size());
 		solution.resize(ros.size());
 		original.resize(ros.size());
-
 		for (std::size_t i = 0; i < ros.size(); i++)
 		{
 			std::size_t v_ros_id = get_ros_id(ros[i]);
@@ -375,7 +293,6 @@ private:
 			solution[v_ros_id] = vertices.row(ros[i]);
 			original[v_ros_id] = vertices.row(ros[i]);
 		}
-
 	}
 
 	/// Construct matrix that corresponds to left-hand side of eq:lap_ber == LP' = b and 
@@ -402,14 +319,11 @@ private:
 				double total_weight = 0;
 				for (int j = 0; j<vec.size(); j++)
 				{
-
 					wij = e_weights(ros[k], vec[j]);
-
 					total_weight = wij + wij; // As wij == wji
 					tripletList.push_back(Eigen::Triplet<double, int>(vi_id, get_ros_id(vec[j]), -total_weight));
 					diagonal_val += total_weight;
 				}
-
 				tripletList.push_back(Eigen::Triplet<double, int>(vi_id, vi_id, diagonal_val));
 			}
 			else
@@ -417,7 +331,6 @@ private:
 				tripletList.push_back(Eigen::Triplet<double, int>(vi_id, vi_id, 1.0));
 			}
 		}
-
 		A->setFromTriplets(tripletList.begin(), tripletList.end());
 		tripletList.clear();
 		double D;
@@ -428,44 +341,35 @@ private:
 	}
 
 	void compute_rotation_subset(int index_from, int index_to) {
-	
 		Timer tmr;
 		Eigen::Matrix3d cov = Eigen::Matrix3d().setZero();
 		std::vector<std::thread> threds;
 		for (std::size_t k = index_from; k <= index_to; k++)
 		{
 			std::size_t vi_id = get_ros_id(ros[k]);
-
 			cov = Eigen::Matrix3d().setZero();
-
 			std::vector<int> vec = adjacent_vertices[ros[k]];
 			double wij = 0;
 			double total_weight = 0;
 			for (int j = 0; j<vec.size(); j++)
 			{
 				wij = e_weights(ros[k], vec[j]);
-
 				std::size_t vj_id = get_ros_id(vec[j]);
-
 				const Eigen::Vector3d& pij = Eigen::Vector3d(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
 				const Eigen::Vector3d& qij = Eigen::Vector3d(solution[vi_id](0) - solution[vj_id](0), solution[vi_id](1) - solution[vj_id](1), solution[vi_id](2) - solution[vj_id](2));
 				cov += wij * (pij * qij.transpose());
 			}
 			compute_close_rotation(cov, rotation_matrix[vi_id]);
 		}
-
 		for (auto& th : threds) {
 			th.join();
 		}
-
 		avg_rotation_time += tmr.elapsed();
-
 	}
 
 	// Covariance matrix S = SumOverOneRing(wij * pij * qij.transpose)
 	void calculate_optimal_rotations()
 	{
-		Timer tmr;
 		Eigen::Matrix3d cov = Eigen::Matrix3d().setZero();
 		std::vector<std::thread> threds;
 		unsigned int n = std::thread::hardware_concurrency();
@@ -488,44 +392,33 @@ private:
 				threds.push_back(std::thread(&Arap_mesh_deformation::compute_rotation_subset, this, index, ros.size() - 1));
 			}
 		}
-
 		for (auto& th : threds) {
 			th.join();
 		}
-
-		avg_rotation_time += tmr.elapsed();
 	}
 
 	void calculate_target_positions(bool apply_acceleration)
 	{
-
-		typename Eigen::VectorXd X(ros.size()), Bx(ros.size());
-		typename Eigen::VectorXd Y(ros.size()), By(ros.size());
-		typename Eigen::VectorXd Z(ros.size()), Bz(ros.size());
-
-
+		Eigen::VectorXd X(ros.size()), Bx(ros.size());
+		Eigen::VectorXd Y(ros.size()), By(ros.size());
+		Eigen::VectorXd Z(ros.size()), Bz(ros.size());
 		for (std::size_t k = 0; k < ros.size(); k++)
 		{
 			std::size_t vi_id = get_ros_id(ros[k]);
-
 			if (is_roi_vertex(ros[k]) && !is_control_vertex(ros[k]))
 			{
-
 				Eigen::Vector3d xyz = Eigen::Vector3d(0, 0, 0);
-
 				std::vector<int> vec = adjacent_vertices[ros[k]];
 				double wij = 0;
 				double total_weight = 0;
 				for (int j = 0; j<vec.size(); j++)
 				{
 					wij = e_weights(ros[k], vec[j]);
-
 					std::size_t vj_id = get_ros_id(vec[j]);
 					const Eigen::Vector3d& pij = Eigen::Vector3d(original[vi_id](0) - original[vj_id](0), original[vi_id](1) - original[vj_id](1), original[vi_id](2) - original[vj_id](2));
 					double wji = wij; // As wij == wji
 					xyz += (wij * rotation_matrix[vi_id] + wji * rotation_matrix[vj_id]) * pij;
 				}
-
 				Bx[vi_id] = xyz(0);
 				By[vi_id] = xyz(1);
 				Bz[vi_id] = xyz(2);
@@ -542,11 +435,8 @@ private:
 		auto sol1 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(Bx), std::ref(X));
 		auto sol2 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(By), std::ref(Y));
 		auto sol3 = std::async(std::launch::async, &Arap_mesh_deformation::solver, this, std::ref(Bz), std::ref(Z));
-
 		bool is_all_solved = sol1.get() && sol2.get() && sol3.get();
-
 		avg_solver_time += tmr.elapsed();
-
 		if (!is_all_solved) {
 			// could not solve all
 			return;
@@ -569,7 +459,6 @@ private:
 				solution[v_id] = p;
 			}
 		}
-
 		prev_X = X;
 		prev_Y = Y;
 		prev_Z = Z;
@@ -593,12 +482,11 @@ private:
 		return ros_id_map[vid];
 	}
 
-	// Calculate the closest rotation, which according to paper is : R = V*(identity_mtrix with last element == det(V*U.transpose()))*U.transpose()
+	// Calculate the closest rotation, using the equation : R = V*(identity_mtrix with last element == det(V*U.transpose()))*U.transpose()
 	// det(V*U.transpose()) can be +1 or -1
 	void compute_close_rotation(const Eigen::Matrix3d m, Eigen::Matrix3d& R)
 	{
 		bool done = compute_polar_decomposition(m, R);
-
 		if (!done)
 		{
 			compute_rotation_svd(m, R);
@@ -609,10 +497,8 @@ private:
 	{
 		Eigen::JacobiSVD<Eigen::Matrix3d> solver;
 		solver.compute(m, Eigen::ComputeFullU | Eigen::ComputeFullV);
-
 		const Eigen::Matrix3d& u = solver.matrixU(); const Eigen::Matrix3d& v = solver.matrixV();
 		R = v * u.transpose();
-
 		// If determinanat of rotation is < 0 , then multiply last column of U with -1 and calculate rotation again
 		if (R.determinant() < 0) {
 			Eigen::Matrix3d u_copy = u;
@@ -628,26 +514,20 @@ private:
 		{
 			return false;
 		}
-
 		typedef Eigen::Matrix3d::Scalar Scalar;
-
 		const Scalar th = std::sqrt(Eigen::NumTraits<Scalar>::dummy_precision());
-
 		Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig;
 		eig.computeDirect(A.transpose()*A);
 		if (eig.eigenvalues()(0) / eig.eigenvalues()(2)<th)
 		{
 			return false;
 		}
-
 		Eigen::Vector3d S = eig.eigenvalues().cwiseSqrt();
 		R = A  * eig.eigenvectors() * S.asDiagonal().inverse() * eig.eigenvectors().transpose();
-
 		if (std::abs(R.squaredNorm() - 3.) > th || R.determinant() < 0)
 		{
 			return false;
 		}
-
 		R.transposeInPlace(); // the optimal rotation matrix should be transpose of decomposition result
 		return true;
 	}
