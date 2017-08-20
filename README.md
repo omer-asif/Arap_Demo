@@ -1,1 +1,1 @@
-# Arap_Demo
+# ARAP Mesh Deformation Algorithm Implementation
